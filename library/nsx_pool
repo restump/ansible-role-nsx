@@ -1,0 +1,384 @@
+#!/usr/bin/env python
+
+# Copyright (c) 2015 Reuben Stump
+#
+# This module is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This software is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this software.  If not, see <http://www.gnu.org/licenses/>.
+
+DOCUMENTATION = '''
+---
+module: nsx_pool
+author: Reuben Stump (stumpr@vmware.com)
+requirements: [ xmltodict ]
+version_added: "1.9"
+short_description: 
+  - Manage VMware NSX IP address pools
+description: 
+  - Manage VMware NSX IP address pools
+options:
+  vsm_hostname:
+    description:
+      - VMware NSX Manager hostname
+    required: true
+  vsm_username:
+    description:
+      - VMware NSX Manager username
+    required: true
+  vsm_password:
+    description:
+      - VMware NSX Manager password
+    required: true
+  pool:
+    description:
+      - Name of the IP pool
+    required: true
+  gateway:
+    description:
+      - Gateway IPv4 or IPv6 address
+    required: true
+  net_prefix:
+    description:
+      - Network prefix length
+    required: true
+  dns1:
+    description:
+      - IP address of primary DNS server
+    required: false
+  dns2:
+    description:
+      - IP address of secondary DNS server
+    required: false
+  dns_suffix:
+    description:
+      - DNS suffix
+    required: false
+    default: null
+  ranges:
+    description:
+      - List of IP address ranges. Range is specified as a string with the start and end 
+        addresses separated by '-': '192.168.1.10-192.168.1.20', '10.10.10.10-10.10.10.10'
+    required: true
+  state:
+    description:
+      - State of IP pool
+    choices: ["absent", "present"]
+    default: "present"
+  scopeid:
+    description:
+      - Scope of IP pool
+    required: false
+    default: globalroot-0
+'''
+
+import json, httplib, ssl, base64, xmltodict, re
+
+class NsxServiceStub(object):
+    """ REST stub to the VMware NSX Manager API """
+    
+    def __init__(self, module, hostname='localhost', username='admin', password='default',
+        scopeid='globalroot-0'):
+        token = base64.standard_b64encode("%s:%s" % (username, password))
+        self.headers = {
+            "Content-Type": "application/xml",
+            "Accept": "application/xml",
+            "Authorization": "Basic %s" % token,
+        }
+        self.hostname = hostname
+        self.module   = module
+        self.scopeid  = scopeid
+        
+        self.schema   = {
+            'SecurityGroup': { 
+                'url': '/api/2.0/services/securitygroup',
+                'tag': 'securitygroup',
+            },
+            'Application': { 
+                'url': '/api/2.0/services/application',
+                'tag': 'application',
+            },
+            'ApplicationGroup': { 
+                'url': '/api/2.0/services/applicationgroup',
+                'tag': 'applicationGroup',
+            },
+            'IPSet': { 
+                'url': '/api/2.0/services/ipset',
+                'tag': 'ipset',
+            },
+            'MACSet': { 
+                'url': '/api/2.0/services/macset',
+                'tag': 'macset',
+            },
+            'Policy': {
+                'url': '/api/2.0/services/policy/securitypolicy',
+                'tag': 'securityPolicy',
+            },
+            'SecurityTag': {
+                'url': '/api/2.0/services/securitytags/tag',
+                'tag': 'securityTag',
+            },
+            'IpAddressPool': {
+                'url': '/api/2.0/services/ipam/pools',
+                'tag': 'ipamAddressPool',
+            },
+            'Edge': {
+                'url': '/api/4.0/edges',
+                'tag': 'edge',
+            },
+        }
+            
+        try:
+            conn = httplib.HTTPSConnection(hostname)
+        except Exception, e:
+            module.fail_json(msg=str(e))
+        self.connection = conn
+        return
+    
+    def __del__(self):
+        self.connection.close()
+    
+    def _invoke(self, verb, path, data):
+        try:
+            self.connection.request(verb, path, data, self.headers)
+            response = self.connection.getresponse()
+        except Exception, e:
+            self.module.fail_json(msg=str(e))
+
+        content  = response.read()
+        status   = response.status
+        location = response.getheader('Location', None)
+        if not 200 <= response.status < 300:
+            self.module.fail_json(msg="http error (%s): %s" % (status, content))
+        return (content, location)
+        
+    def getloc(self, location):
+        (content, location) = self._invoke('GET', location, None)
+        doc = xmltodict.parse(content)
+        return doc.values()[0] # Hack to get around unknown XML root node
+
+    def getall(self, type):
+        base_url = self.schema[type]['url']
+        tag = self.schema[type]['tag']
+        
+        if type == 'Policy':
+            request_url = "%s/all" % (base_url)
+        elif type == 'SecurityTag':
+            request_url = base_url
+        else:
+            request_url = "%s/scope/%s" % (base_url, self.scopeid)
+        (content, location) = self._invoke('GET', request_url, None)
+        
+        doc = xmltodict.parse(content)
+        if type == 'Policy':
+            objects = doc['securityPolicies'][tag]
+        elif type == 'SecurityTag':
+            objects = doc['securityTags'][tag]
+        elif type == 'IpAddressPool':
+            objects = doc['ipamAddressPools'][tag]
+        else:
+            objects = doc['list'][tag]
+        
+        if not isinstance(objects, list):
+            objects = [ objects ]
+        return objects   
+
+    def lookup(self, type, key, val):
+        tag = self.schema[type]['tag']        
+        objects = self.getall(type)
+        
+        found = None
+        for object in objects:
+            if object[key] == val:
+                found = object
+        return found
+        
+    def create(self, type, properties):
+        base_url = self.schema[type]['url']
+        if type == 'SecurityGroup':
+            request_url = "%s/bulk/%s" % (base_url, self.scopeid)
+        elif type == 'Policy':
+            request_url = base_url
+        elif type == 'SecurityTag':
+            request_url = base_url
+        elif type == 'IpAddressPool':
+            request_url = "%s/scope/%s" % (base_url, self.scopeid)
+        else:
+            request_url = "%s/%s" % (base_url, self.scopeid)
+        tag = self.schema[type]['tag']
+        
+        doc = { tag: { } }
+        for k,v in properties.iteritems():
+            doc[tag][k] = v
+        (content, location) = self._invoke('POST', request_url, xmltodict.unparse(doc))
+        # Bug in the NSX API, for SecurityTag objects, returns incorrect location.
+        if type == 'SecurityTag':
+            id = re.search('.*/(.{1,})$', location).group(1)
+            location = "%s/%s" % (request_url, id)
+        return self.getloc(location)
+
+    def delete(self, object, force=False):
+        id = object['objectId']
+        type = object['objectTypeName']
+        
+        base_url = self.schema[type]['url']
+        request_url = "%s/%s?force=%s" % (base_url, id, str(force).lower())
+        (content, location) = self._invoke('DELETE', request_url, None)
+        return
+    
+    def update(self, object, properties):
+        id = object['objectId']
+        type = object['objectTypeName']
+        
+        tag = self.schema[type]['tag']
+        base_url = self.schema[type]['url']
+        if type == 'SecurityGroup':
+            request_url = "%s/bulk/%s" % (base_url, id)
+        else:
+            request_url = "%s/%s" % (base_url, id)
+            
+        for k,v in properties.iteritems():
+            object[k] = v
+            
+        doc = { tag: object }
+        (content, location) = self._invoke('PUT', request_url, xmltodict.unparse(doc))
+        return
+
+def compare(stub, object, properties, ranges):
+    for k,v in properties.iteritems():
+        if isinstance(v, bool):
+            val = str(v).lower()
+        else:
+            val = str(v)
+        if not object[k] == val:
+            return True
+
+    if object.get('ipRanges', None) == None:
+        return True
+    range_list = object['ipRanges'].get('ipRangeDto', [ ])
+    if not isinstance(range_list, list):
+        range_list = [ range_list ]
+    
+    # Parse ranges
+    ip_ranges = [ ]
+    for range in ranges:
+        parts = range.split('-')
+        if len(parts) != 2:
+            stub.module.fail_json(msg="incorrect ip address range string syntax: '%s'" % range)
+        ip_ranges.append({ 'startAddress': parts[0], 'endAddress': parts[1] })
+    
+    for range in range_list:
+        start = range['startAddress']
+        end   = range['endAddress']
+        found = False
+        
+        for ipset in ip_ranges:
+            if start == ipset['startAddress'] and end == ipset['endAddress']:
+                found = True
+        if not found:
+            return True
+
+    return False
+    
+def update_ranges(stub, properties, ranges):
+    ip_ranges = { 'ipRangeDto': [ ] }
+    for range in ranges:
+        parts = range.split('-')
+        if len(parts) != 2:
+            stub.module.fail_json(msg="incorrect ip address range string syntax: '%s'" % range)
+        first = parts[0]
+        last  = parts[1] 
+        
+        range_dto = { 'startAddress': first, 'endAddress': last }
+        ip_ranges['ipRangeDto'].append(range_dto)
+    properties['ipRanges'] = ip_ranges
+    return
+        
+def main():
+    module = AnsibleModule(
+        argument_spec = dict(
+            vsm_hostname = dict(type='str', required=True),
+            vsm_username = dict(type='str', required=True),
+            vsm_password = dict(type='str', required=True),
+            scopeid = dict(type='str', required=False, default='globalroot-0'),
+            pool = dict(type='str', required=True),
+            gateway = dict(type='str', required=True),
+            net_prefix = dict(type='int', required=True),
+            dns1 = dict(type='str', required=False, default=None),
+            dns2 = dict(type='str', required=False, default=None),
+            dns_suffix = dict(type='str', required=False, default=None),
+            ranges = dict(type='list', required=True),
+            state = dict(type='str', required=False, choices=['present', 'absent'], default='present'),
+        ),
+        supports_check_mode = True,
+    )
+
+    stub = NsxServiceStub(
+        module, 
+        hostname=module.params['vsm_hostname'],
+        username=module.params['vsm_username'],
+        password=module.params['vsm_password'],
+        scopeid=module.params['scopeid'],
+    )
+    
+    pool = stub.lookup('IpAddressPool', 'name', module.params['pool'])
+    if pool == None:
+        state = 'absent'
+    else:
+        state = 'present'
+
+    dns_servers = module.params.get('dns_servers', [ ])
+    if len(dns_servers) > 0:
+        dns1 = dns_servers[0]
+    if len(dns_servers) > 1:
+        dns2 = dns_servers[1]
+    properties = {
+        'name': module.params['pool'],
+        'gateway': module.params['gateway'],
+        'prefixLength': str(module.params['net_prefix']),
+        'dnsSuffix': module.params['dns_suffix'],
+        'dnsServer1': module.params['dns1'],
+        'dnsServer2': module.params['dns2']
+    }
+    ranges = module.params['ranges']
+    
+    changed = False    
+    if module.params['state'] == 'absent':
+        if state == 'present':
+            changed = True
+            if not module.check_mode:
+                stub.delete(pool)
+    if module.params['state'] == 'present':
+        if state == 'absent':
+            changed = True
+            if not module.check_mode:
+                update_ranges(stub, properties, ranges)
+                pool = stub.create('IpAddressPool', properties)
+        else:
+            changed = compare(stub, pool, properties, ranges)
+            if changed and not module.check_mode:
+                update_ranges(stub, properties, ranges)
+                stub.update(pool, properties)
+    
+    if pool:
+        objectId = pool['objectId']
+    else:
+        objectId = None
+    result = dict(changed=changed, objectId=objectId)
+    module.exit_json(**result)
+ 
+from ansible.module_utils.basic import *
+main()
+ 
+    
+    
+    
+    

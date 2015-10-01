@@ -1,0 +1,382 @@
+#!/usr/bin/env python
+
+# Copyright (c) 2015 Reuben Stump
+#
+# This module is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This software is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this software.  If not, see <http://www.gnu.org/licenses/>.
+
+DOCUMENTATION = '''
+---
+module: nsx_pool_allocate
+author: Reuben Stump (stumpr@vmware.com)
+requirements: [ xmltodict ]
+version_added: "1.9"
+short_description: 
+  - Manage VMware NSX IP address pool allocations
+description: 
+  - Manage VMware NSX IP address pool allocations
+options:
+  vsm_hostname:
+    description:
+      - VMware NSX Manager hostname
+    required: true
+  vsm_username:
+    description:
+      - VMware NSX Manager username
+    required: true
+  vsm_password:
+    description:
+      - VMware NSX Manager password
+    required: true
+  pool:
+    description:
+      - Name of the IP pool
+    required: true
+  ip:
+    description:
+      - IP address to reserve from the specified pool
+    required: false
+    default: null
+  state:
+    description:
+      - State of IP pool address allocation
+    choices: ["absent", "present"]
+    default: "present"
+  scopeid:
+    description:
+      - Scope of IP pool address allocation
+    required: false
+    default: globalroot-0
+'''
+
+import json, httplib, ssl, base64, xmltodict, re
+
+class NsxServiceStub(object):
+    """ REST stub to the VMware NSX Manager API """
+    
+    def __init__(self, module, hostname='localhost', username='admin', password='default',
+        scopeid='globalroot-0'):
+        token = base64.standard_b64encode("%s:%s" % (username, password))
+        self.headers = {
+            "Content-Type": "application/xml",
+            "Accept": "application/xml",
+            "Authorization": "Basic %s" % token,
+        }
+        self.hostname = hostname
+        self.module   = module
+        self.scopeid  = scopeid
+        
+        self.schema   = {
+            'SecurityGroup': { 
+                'url': '/api/2.0/services/securitygroup',
+                'tag': 'securitygroup',
+            },
+            'Application': { 
+                'url': '/api/2.0/services/application',
+                'tag': 'application',
+            },
+            'ApplicationGroup': { 
+                'url': '/api/2.0/services/applicationgroup',
+                'tag': 'applicationGroup',
+            },
+            'IPSet': { 
+                'url': '/api/2.0/services/ipset',
+                'tag': 'ipset',
+            },
+            'MACSet': { 
+                'url': '/api/2.0/services/macset',
+                'tag': 'macset',
+            },
+            'Policy': {
+                'url': '/api/2.0/services/policy/securitypolicy',
+                'tag': 'securityPolicy',
+            },
+            'SecurityTag': {
+                'url': '/api/2.0/services/securitytags/tag',
+                'tag': 'securityTag',
+            },
+            'IpAddressPool': {
+                'url': '/api/2.0/services/ipam/pools',
+                'tag': 'ipamAddressPool',
+            },
+            'Edge': {
+                'url': '/api/4.0/edges',
+                'tag': 'edge',
+            },
+        }
+            
+        try:
+            conn = httplib.HTTPSConnection(hostname)
+        except Exception, e:
+            module.fail_json(msg=str(e))
+        self.connection = conn
+        return
+    
+    def __del__(self):
+        self.connection.close()
+    
+    def _invoke(self, verb, path, data):
+        try:
+            self.connection.request(verb, path, data, self.headers)
+            response = self.connection.getresponse()
+        except Exception, e:
+            self.module.fail_json(msg=str(e))
+
+        content  = response.read()
+        status   = response.status
+        location = response.getheader('Location', None)
+        if not 200 <= response.status < 300:
+            self.module.fail_json(msg="http error (%s): %s" % (status, content))
+        return (content, location)
+        
+    def getloc(self, location):
+        (content, location) = self._invoke('GET', location, None)
+        doc = xmltodict.parse(content)
+        return doc.values()[0] # Hack to get around unknown XML root node
+
+    def getall(self, type):
+        base_url = self.schema[type]['url']
+        tag = self.schema[type]['tag']
+        
+        if type == 'Policy':
+            request_url = "%s/all" % (base_url)
+        elif type == 'SecurityTag':
+            request_url = base_url
+        else:
+            request_url = "%s/scope/%s" % (base_url, self.scopeid)
+        (content, location) = self._invoke('GET', request_url, None)
+        
+        doc = xmltodict.parse(content)
+        if type == 'Policy':
+            objects = doc['securityPolicies'][tag]
+        elif type == 'SecurityTag':
+            objects = doc['securityTags'][tag]
+        elif type == 'IpAddressPool':
+            objects = doc['ipamAddressPools'][tag]
+        else:
+            objects = doc['list'][tag]
+        
+        if not isinstance(objects, list):
+            objects = [ objects ]
+        return objects   
+
+    def lookup(self, type, key, val):
+        tag = self.schema[type]['tag']        
+        objects = self.getall(type)
+        
+        found = None
+        for object in objects:
+            if object[key] == val:
+                found = object
+        return found
+        
+    def create(self, type, properties):
+        base_url = self.schema[type]['url']
+        if type == 'SecurityGroup':
+            request_url = "%s/bulk/%s" % (base_url, self.scopeid)
+        elif type == 'Policy':
+            request_url = base_url
+        elif type == 'SecurityTag':
+            request_url = base_url
+        elif type == 'IpAddressPool':
+            request_url = "%s/scope/%s" % (base_url, self.scopeid)
+        else:
+            request_url = "%s/%s" % (base_url, self.scopeid)
+        tag = self.schema[type]['tag']
+        
+        doc = { tag: { } }
+        for k,v in properties.iteritems():
+            doc[tag][k] = v
+        (content, location) = self._invoke('POST', request_url, xmltodict.unparse(doc))
+        # Bug in the NSX API, for SecurityTag objects, returns incorrect location.
+        if type == 'SecurityTag':
+            id = re.search('.*/(.{1,})$', location).group(1)
+            location = "%s/%s" % (request_url, id)
+        return self.getloc(location)
+
+    def delete(self, object, force=False):
+        id = object['objectId']
+        type = object['objectTypeName']
+        
+        base_url = self.schema[type]['url']
+        request_url = "%s/%s?force=%s" % (base_url, id, str(force).lower())
+        (content, location) = self._invoke('DELETE', request_url, None)
+        return
+    
+    def update(self, object, properties):
+        id = object['objectId']
+        type = object['objectTypeName']
+        
+        tag = self.schema[type]['tag']
+        base_url = self.schema[type]['url']
+        if type == 'SecurityGroup':
+            request_url = "%s/bulk/%s" % (base_url, id)
+        else:
+            request_url = "%s/%s" % (base_url, id)
+            
+        for k,v in properties.iteritems():
+            object[k] = v
+            
+        doc = { tag: object }
+        (content, location) = self._invoke('PUT', request_url, xmltodict.unparse(doc))
+        return
+
+def is_allocated(stub, pool, ipaddress):
+    if ipaddress == None:
+        return None
+
+    id = pool['objectId']
+    type = pool['objectTypeName']
+    tag = stub.schema[type]['tag']
+    base_url = stub.schema[type]['url']
+    
+    # check ip pool allocations
+    request_url = "%s/%s/ipaddresses" % (base_url, id)
+    (content, location) = stub._invoke('GET', request_url, None)
+    doc = xmltodict.parse(content)
+    
+    root = doc.get('allocatedIpAddresses', None)
+    if root == None:
+        return None
+        
+    allocated = root.get('allocatedIpAddress', [ ])
+    if allocated == None:
+        return None
+    if not isinstance(allocated, list):
+        allocated = [ allocated ]
+    
+    for address in allocated:
+        if address['ipAddress'] == ipaddress:
+            info = {
+                'id': address['id'],
+                'ipAddress': address.get('ipAddress', None),
+                'gateway': address.get('gateway', None),
+                'prefixLength': address.get('prefixLength', None),
+                'dnsServer1': address.get('dnsServer1', None),
+                'dnsServer2': address.get('dnsServer2', None),
+                'dnsSuffix': address.get('dnsSuffix', None),
+                'allocationNote': address.get('allocationNote', None),
+            }
+            return info
+    return None
+    
+def reserve_ipaddress(stub, pool, ipaddress):
+    id = pool['objectId']
+    type = pool['objectTypeName']
+    tag = stub.schema[type]['tag']
+    base_url = stub.schema[type]['url']
+    request_url = "%s/%s/ipaddresses" % (base_url, id)
+       
+    if ipaddress == None:
+        request = { 
+            'ipAddressRequest': { 
+                'allocationMode': 'ALLOCATE',
+            }
+        }
+    else:
+        request = { 
+            'ipAddressRequest': { 
+                'allocationMode': 'RESERVE',
+                'ipAddress': ipaddress,
+            } 
+        }
+    
+    (content, location) = stub._invoke('POST', request_url, xmltodict.unparse(request))
+    doc = xmltodict.parse(content)
+    
+    info = {
+        'id': doc['allocatedIpAddress']['id'],
+        'ipAddress': doc['allocatedIpAddress']['ipAddress'],
+        'gateway': doc['allocatedIpAddress']['gateway'],
+        'prefixLength': doc['allocatedIpAddress']['prefixLength'],
+        'dnsServer1': doc['allocatedIpAddress']['dnsServer1'],
+        'dnsServer2': doc['allocatedIpAddress']['dnsServer2'],
+        'dnsSuffix': doc['allocatedIpAddress']['dnsSuffix'],
+    }
+    return info
+   
+def release_ipaddress(stub, pool, ipaddress):
+    if ipaddress == None:
+        return
+    
+    id = pool['objectId']
+    type = pool['objectTypeName']
+    tag = stub.schema[type]['tag']
+    base_url = stub.schema[type]['url']
+    request_url = "%s/%s/ipaddresses/%s" % (base_url, id, ipaddress)
+    
+    (content, location) = stub._invoke('DELETE', request_url, None)
+    return
+           
+def main():
+    module = AnsibleModule(
+        argument_spec = dict(
+            vsm_hostname = dict(type='str', required=True),
+            vsm_username = dict(type='str', required=True),
+            vsm_password = dict(type='str', required=True),
+            scopeid = dict(type='str', required=False, default='globalroot-0'),
+            pool = dict(type='str', required=True),
+            ip = dict(type='str', required=False, default=None),
+            state = dict(type='str', required=False, choices=['present', 'absent'], default='present'),
+        ),
+        supports_check_mode = True,
+    )
+
+    stub = NsxServiceStub(
+        module, 
+        hostname=module.params['vsm_hostname'],
+        username=module.params['vsm_username'],
+        password=module.params['vsm_password'],
+        scopeid=module.params['scopeid'],
+    )
+    
+    pool = stub.lookup('IpAddressPool', 'name', module.params['pool'])
+    if pool == None:
+        state = 'absent'
+    else:
+        state = 'present'
+
+    ipaddress = module.params['ip']
+    changed = False
+    info = None    
+    if module.params['state'] == 'absent':
+        if state == 'present':
+            info = is_allocated(stub, pool, ipaddress)
+            if info:
+                changed = True
+            if changed and not module.check_mode:
+                release_ipaddress(stub, pool, ipaddress)
+    if module.params['state'] == 'present':
+        if state == 'absent':
+            module.fail_json(msg="specified ip pool '%s' does not exist" % (module.params['pool']))
+        else:
+            info = is_allocated(stub, pool, ipaddress)
+            if info == None:
+                changed = True
+            if changed and not module.check_mode:
+                info = reserve_ipaddress(stub, pool, ipaddress)
+    
+    if pool:
+        objectId = pool['objectId']
+    else:
+        objectId = None
+    result = dict(changed=changed, objectId=objectId, info=info)
+    module.exit_json(**result)
+ 
+from ansible.module_utils.basic import *
+main()
+ 
+    
+    
+    
+    

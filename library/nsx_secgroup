@@ -1,0 +1,379 @@
+#!/usr/bin/env python
+
+# Copyright (c) 2015 Reuben Stump
+#
+# This module is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This software is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this software.  If not, see <http://www.gnu.org/licenses/>.
+
+DOCUMENTATION = '''
+---
+module: nsx_secgroup
+author: Reuben Stump (stumpr@vmware.com)
+requirements: [ xmltodict ]
+version_added: "1.9"
+short_description: 
+  - Manage VMware NSX Security Groups
+description: 
+  - Manage VMware NSX Security Groups
+options:
+  vsm_hostname:
+    description:
+      - VMware NSX Manager hostname
+    required: true
+  vsm_username:
+    description:
+      - VMware NSX Manager username
+    required: true
+  vsm_password:
+    description:
+      - VMware NSX Manager password
+    required: true
+  secgroup:
+    description:
+      - Name of security group object
+    required: true
+  comment:
+    description:
+      - Comment (description) of security group object
+    required: false
+    default: null
+  included:
+    description: 
+      - List of included static member ids for this security group. For NSX objects, use
+        the objectId property value.  For vSphere objects, use the vSphere managed object
+        reference (moref) value. vNICs objects are supported, but require the NSX objectId
+        from NSX <config.instanceUuid>.#
+    required: false
+    default: null
+  excluded:
+    description: 
+      - List of excluded static member ids for this security group. For NSX objects, use
+        the objectId property value.  For vSphere objects, use the vSphere managed object
+        reference (moref) value. vNICs objects are supported, but require the NSX objectId
+        from NSX <config.instanceUuid>.#
+    required: false
+    default: null
+  state:
+    description:
+      - State of security group object
+    choices: ["absent", "present"]
+    default: "present"
+  scopeid:
+    description:
+      - Scope of security group
+    required: false
+    default: globalroot-0
+'''
+
+import json, httplib, ssl, base64, xmltodict, re
+
+class NsxServiceStub(object):
+    """ REST stub to the VMware NSX Manager API """
+    
+    def __init__(self, module, hostname='localhost', username='admin', password='default',
+        scopeid='globalroot-0'):
+        token = base64.standard_b64encode("%s:%s" % (username, password))
+        self.headers = {
+            "Content-Type": "application/xml",
+            "Accept": "application/xml",
+            "Authorization": "Basic %s" % token,
+        }
+        self.hostname = hostname
+        self.module   = module
+        self.scopeid  = scopeid
+        
+        self.schema   = {
+            'SecurityGroup': { 
+                'url': '/api/2.0/services/securitygroup',
+                'tag': 'securitygroup',
+            },
+            'Application': { 
+                'url': '/api/2.0/services/application',
+                'tag': 'application',
+            },
+            'ApplicationGroup': { 
+                'url': '/api/2.0/services/applicationgroup',
+                'tag': 'applicationGroup',
+            },
+            'IPSet': { 
+                'url': '/api/2.0/services/ipset',
+                'tag': 'ipset',
+            },
+            'MACSet': { 
+                'url': '/api/2.0/services/macset',
+                'tag': 'macset',
+            },
+            'Policy': {
+                'url': '/api/2.0/services/policy/securitypolicy',
+                'tag': 'securityPolicy',
+            },
+            'SecurityTag': {
+                'url': '/api/2.0/services/securitytags/tag',
+                'tag': 'securityTag',
+            },
+            'IpAddressPool': {
+                'url': '/api/2.0/services/ipam/pools',
+                'tag': 'ipamAddressPool',
+            },
+            'Edge': {
+                'url': '/api/4.0/edges',
+                'tag': 'edge',
+            },
+        }
+            
+        try:
+            conn = httplib.HTTPSConnection(hostname)
+        except Exception, e:
+            module.fail_json(msg=str(e))
+        self.connection = conn
+        return
+    
+    def __del__(self):
+        self.connection.close()
+    
+    def _invoke(self, verb, path, data):
+        try:
+            self.connection.request(verb, path, data, self.headers)
+            response = self.connection.getresponse()
+        except Exception, e:
+            self.module.fail_json(msg=str(e))
+
+        content  = response.read()
+        status   = response.status
+        location = response.getheader('Location', None)
+        if not 200 <= response.status < 300:
+            self.module.fail_json(msg="http error (%s): %s" % (status, content))
+        return (content, location)
+        
+    def getloc(self, location):
+        (content, location) = self._invoke('GET', location, None)
+        doc = xmltodict.parse(content)
+        return doc.values()[0] # Hack to get around unknown XML root node
+
+    def getall(self, type):
+        base_url = self.schema[type]['url']
+        tag = self.schema[type]['tag']
+        
+        if type == 'Policy':
+            request_url = "%s/all" % (base_url)
+        elif type == 'SecurityTag':
+            request_url = base_url
+        else:
+            request_url = "%s/scope/%s" % (base_url, self.scopeid)
+        (content, location) = self._invoke('GET', request_url, None)
+        
+        doc = xmltodict.parse(content)
+        if type == 'Policy':
+            objects = doc['securityPolicies'][tag]
+        elif type == 'SecurityTag':
+            objects = doc['securityTags'][tag]
+        elif type == 'IpAddressPool':
+            objects = doc['ipamAddressPools'][tag]
+        else:
+            objects = doc['list'][tag]
+        
+        if not isinstance(objects, list):
+            objects = [ objects ]
+        return objects   
+
+    def lookup(self, type, key, val):
+        tag = self.schema[type]['tag']        
+        objects = self.getall(type)
+        
+        found = None
+        for object in objects:
+            if object[key] == val:
+                found = object
+        return found
+        
+    def create(self, type, properties):
+        base_url = self.schema[type]['url']
+        if type == 'SecurityGroup':
+            request_url = "%s/bulk/%s" % (base_url, self.scopeid)
+        elif type == 'Policy':
+            request_url = base_url
+        elif type == 'SecurityTag':
+            request_url = base_url
+        elif type == 'IpAddressPool':
+            request_url = "%s/scope/%s" % (base_url, self.scopeid)
+        else:
+            request_url = "%s/%s" % (base_url, self.scopeid)
+        tag = self.schema[type]['tag']
+        
+        doc = { tag: { } }
+        for k,v in properties.iteritems():
+            doc[tag][k] = v
+        (content, location) = self._invoke('POST', request_url, xmltodict.unparse(doc))
+        # Bug in the NSX API, for SecurityTag objects, returns incorrect location.
+        if type == 'SecurityTag':
+            id = re.search('.*/(.{1,})$', location).group(1)
+            location = "%s/%s" % (request_url, id)
+        return self.getloc(location)
+
+    def delete(self, object, force=False):
+        id = object['objectId']
+        type = object['objectTypeName']
+        
+        base_url = self.schema[type]['url']
+        request_url = "%s/%s?force=%s" % (base_url, id, str(force).lower())
+        (content, location) = self._invoke('DELETE', request_url, None)
+        return
+    
+    def update(self, object, properties):
+        id = object['objectId']
+        type = object['objectTypeName']
+        
+        tag = self.schema[type]['tag']
+        base_url = self.schema[type]['url']
+        if type == 'SecurityGroup':
+            request_url = "%s/bulk/%s" % (base_url, id)
+        else:
+            request_url = "%s/%s" % (base_url, id)
+            
+        for k,v in properties.iteritems():
+            object[k] = v
+            
+        doc = { tag: object }
+        (content, location) = self._invoke('PUT', request_url, xmltodict.unparse(doc))
+        return
+
+def compare(object, properties, included_ids, excluded_ids):
+
+    # Iterate included members
+    members = object.get('member', None)
+    if members == None:
+        members = [ ]
+    if not isinstance(members, list):
+        members = [ members ]
+    
+    if len(included_ids) != len(members):
+        return True
+    for id in included_ids:
+        found = False
+        for member in members:
+            if id == member['objectId']:
+                found = True
+        if not found:
+            return True
+            
+    # Iterate excluded members
+    members = object.get('excludeMember', None)
+    if members == None:
+        members = [ ]
+    if not isinstance(members, list):
+        members = [ members ]
+    
+    if len(excluded_ids) != len(members):
+        return True
+    for id in excluded_ids:
+        found = False
+        for member in members:
+            if id == member['objectId']:
+                found = True
+        if not found:
+            return True
+
+    for k,v in properties.iteritems():
+        if isinstance(v, bool):
+            val = str(v).lower()
+        else:
+            val = str(v)
+        if not object[k] == val:
+            return True
+    return False
+    
+def update_members(properties, included_ids, excluded_ids):
+    properties['member'] = [ ]
+    for id in included_ids:
+        properties['member'].append({ 'objectId': id })
+    return
+     
+    properties['excludeMember'] = [ ]
+    for id in included_ids:
+        properties['excludeMember'].append({ 'objectId': id })
+    return   
+    
+        
+def main():
+    module = AnsibleModule(
+        argument_spec = dict(
+            vsm_hostname = dict(type='str', required=True),
+            vsm_username = dict(type='str', required=True),
+            vsm_password = dict(type='str', required=True),
+            scopeid = dict(type='str', required=False, default='globalroot-0'),
+            secgroup = dict(type='str', required=True),
+            comment = dict(type='str', required=False),
+            included = dict(type='list', required=False, default=None),
+            excluded = dict(type='list', required=False, default=None),
+            state = dict(type='str', required=False, choices=['present', 'absent'], default='present'),
+        ),
+        supports_check_mode = True,
+    )
+
+    stub = NsxServiceStub(
+        module, 
+        hostname=module.params['vsm_hostname'],
+        username=module.params['vsm_username'],
+        password=module.params['vsm_password'],
+        scopeid=module.params['scopeid'],
+    )
+
+    properties = {
+        'name': module.params['secgroup'],
+        'description': module.params['comment'],
+    }
+    
+    included_ids = module.params['included']
+    if included_ids == None:
+        included_ids = [ ]
+    excluded_ids = module.params['excluded']
+    if excluded_ids == None:
+        excluded_ids = [ ]
+    
+    group = stub.lookup('SecurityGroup', 'name', module.params['secgroup'])
+    if group == None:
+        state = 'absent'
+    else:
+        state = 'present'
+
+    changed = False        
+    if module.params['state'] == 'absent':
+        if state == 'present':
+            changed = True
+            if not module.check_mode:
+                stub.delete(group)
+    if module.params['state'] == 'present':
+        if state == 'absent':
+            changed = True
+            if not module.check_mode:
+                update_members(properties, included_ids, excluded_ids)
+                group = stub.create('SecurityGroup', properties)
+        else:
+            changed = compare(group, properties, included_ids, excluded_ids)
+            if not module.check_mode and changed:
+                update_members(properties, included_ids, excluded_ids)
+                stub.update(group, properties)
+    
+    if group:
+        objectId = group['objectId']
+    else:
+        objectId = None
+    result = dict(changed=changed, objectId=objectId)
+    module.exit_json(**result)
+
+from ansible.module_utils.basic import *
+main()
+
+
+
+

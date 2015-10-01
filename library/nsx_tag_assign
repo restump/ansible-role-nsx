@@ -1,0 +1,350 @@
+#!/usr/bin/env python
+
+# Copyright (c) 2015 Reuben Stump
+#
+# This module is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This software is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this software.  If not, see <http://www.gnu.org/licenses/>.
+
+DOCUMENTATION = '''
+---
+module: nsx_tag_vm
+author: Reuben Stump (stumpr@vmware.com)
+requirements: [ xmltodict ]
+version_added: "1.9"
+short_description: 
+  - Manage VMware NSX security tag assignment to virtual machines
+description: 
+  - Manage VMware NSX security tag assignment to virtual machines
+options:
+  vsm_hostname:
+    description:
+      - VMware NSX Manager hostname
+    required: true
+  vsm_username:
+    description:
+      - VMware NSX Manager username
+    required: true
+  vsm_password:
+    description:
+      - VMware NSX Manager password
+    required: true
+  tag:
+    description:
+      - Name of the security tag
+    required: true
+  vms:
+    description:
+      - List of VirtualMachine managed object references (vmMoids)
+    required: true
+  state:
+    description:
+      - State of security tag assignment to specified virtual machine
+    choices: ["absent", "present"]
+    default: "present"
+  scopeid:
+    description:
+      - Scope of security tag
+    required: false
+    default: globalroot-0
+'''
+
+import json, httplib, ssl, base64, xmltodict, re
+
+class NsxServiceStub(object):
+    """ REST stub to the VMware NSX Manager API """
+    
+    def __init__(self, module, hostname='localhost', username='admin', password='default',
+        scopeid='globalroot-0'):
+        token = base64.standard_b64encode("%s:%s" % (username, password))
+        self.headers = {
+            "Content-Type": "application/xml",
+            "Accept": "application/xml",
+            "Authorization": "Basic %s" % token,
+        }
+        self.hostname = hostname
+        self.module   = module
+        self.scopeid  = scopeid
+        
+        self.schema   = {
+            'SecurityGroup': { 
+                'url': '/api/2.0/services/securitygroup',
+                'tag': 'securitygroup',
+            },
+            'Application': { 
+                'url': '/api/2.0/services/application',
+                'tag': 'application',
+            },
+            'ApplicationGroup': { 
+                'url': '/api/2.0/services/applicationgroup',
+                'tag': 'applicationGroup',
+            },
+            'IPSet': { 
+                'url': '/api/2.0/services/ipset',
+                'tag': 'ipset',
+            },
+            'MACSet': { 
+                'url': '/api/2.0/services/macset',
+                'tag': 'macset',
+            },
+            'Policy': {
+                'url': '/api/2.0/services/policy/securitypolicy',
+                'tag': 'securityPolicy',
+            },
+            'SecurityTag': {
+                'url': '/api/2.0/services/securitytags/tag',
+                'tag': 'securityTag',
+            },
+            'IpAddressPool': {
+                'url': '/api/2.0/services/ipam/pools',
+                'tag': 'ipamAddressPool',
+            },
+            'Edge': {
+                'url': '/api/4.0/edges',
+                'tag': 'edge',
+            },
+        }
+            
+        try:
+            conn = httplib.HTTPSConnection(hostname)
+        except Exception, e:
+            module.fail_json(msg=str(e))
+        self.connection = conn
+        return
+    
+    def __del__(self):
+        self.connection.close()
+    
+    def _invoke(self, verb, path, data):
+        try:
+            self.connection.request(verb, path, data, self.headers)
+            response = self.connection.getresponse()
+        except Exception, e:
+            self.module.fail_json(msg=str(e))
+
+        content  = response.read()
+        status   = response.status
+        location = response.getheader('Location', None)
+        if not 200 <= response.status < 300:
+            self.module.fail_json(msg="http error (%s): %s" % (status, content))
+        return (content, location)
+        
+    def getloc(self, location):
+        (content, location) = self._invoke('GET', location, None)
+        doc = xmltodict.parse(content)
+        return doc.values()[0] # Hack to get around unknown XML root node
+
+    def getall(self, type):
+        base_url = self.schema[type]['url']
+        tag = self.schema[type]['tag']
+        
+        if type == 'Policy':
+            request_url = "%s/all" % (base_url)
+        elif type == 'SecurityTag':
+            request_url = base_url
+        else:
+            request_url = "%s/scope/%s" % (base_url, self.scopeid)
+        (content, location) = self._invoke('GET', request_url, None)
+        
+        doc = xmltodict.parse(content)
+        if type == 'Policy':
+            objects = doc['securityPolicies'][tag]
+        elif type == 'SecurityTag':
+            objects = doc['securityTags'][tag]
+        elif type == 'IpAddressPool':
+            objects = doc['ipamAddressPools'][tag]
+        else:
+            objects = doc['list'][tag]
+        
+        if not isinstance(objects, list):
+            objects = [ objects ]
+        return objects   
+
+    def lookup(self, type, key, val):
+        tag = self.schema[type]['tag']        
+        objects = self.getall(type)
+        
+        found = None
+        for object in objects:
+            if object[key] == val:
+                found = object
+        return found
+        
+    def create(self, type, properties):
+        base_url = self.schema[type]['url']
+        if type == 'SecurityGroup':
+            request_url = "%s/bulk/%s" % (base_url, self.scopeid)
+        elif type == 'Policy':
+            request_url = base_url
+        elif type == 'SecurityTag':
+            request_url = base_url
+        elif type == 'IpAddressPool':
+            request_url = "%s/scope/%s" % (base_url, self.scopeid)
+        else:
+            request_url = "%s/%s" % (base_url, self.scopeid)
+        tag = self.schema[type]['tag']
+        
+        doc = { tag: { } }
+        for k,v in properties.iteritems():
+            doc[tag][k] = v
+        (content, location) = self._invoke('POST', request_url, xmltodict.unparse(doc))
+        # Bug in the NSX API, for SecurityTag objects, returns incorrect location.
+        if type == 'SecurityTag':
+            id = re.search('.*/(.{1,})$', location).group(1)
+            location = "%s/%s" % (request_url, id)
+        return self.getloc(location)
+
+    def delete(self, object, force=False):
+        id = object['objectId']
+        type = object['objectTypeName']
+        
+        base_url = self.schema[type]['url']
+        request_url = "%s/%s?force=%s" % (base_url, id, str(force).lower())
+        (content, location) = self._invoke('DELETE', request_url, None)
+        return
+    
+    def update(self, object, properties):
+        id = object['objectId']
+        type = object['objectTypeName']
+        
+        tag = self.schema[type]['tag']
+        base_url = self.schema[type]['url']
+        if type == 'SecurityGroup':
+            request_url = "%s/bulk/%s" % (base_url, id)
+        else:
+            request_url = "%s/%s" % (base_url, id)
+            
+        for k,v in properties.iteritems():
+            object[k] = v
+            
+        doc = { tag: object }
+        (content, location) = self._invoke('PUT', request_url, xmltodict.unparse(doc))
+        return
+
+def compare_attached(stub, security_tag, vm_ids):
+    request_url = "%s/%s/vm" % (stub.schema['SecurityTag']['url'], security_tag['objectId'])
+    (content, location) = stub._invoke('GET', request_url, None)
+    
+    doc = xmltodict.parse(content)
+    if doc['basicinfolist'] == None:
+        return True
+
+    attached_vms = doc['basicinfolist']['basicinfo']
+    if not isinstance(attached_vms, list):
+        attached_vms = [ attached_vms ]
+    
+    found_count = 0
+    for vm in attached_vms:
+        for id in vm_ids:
+            if vm['objectId'] == id:
+                found_count = found_count + 1
+    
+    if found_count != len(vm_ids):
+        return True
+    return False
+    
+def compare_detached(stub, security_tag, vm_ids):
+    request_url = "%s/%s/vm" % (stub.schema['SecurityTag']['url'], security_tag['objectId'])
+    (content, location) = stub._invoke('GET', request_url, None)
+    
+    doc = xmltodict.parse(content)
+    if doc['basicinfolist'] == None:
+        return True
+
+    attached_vms = doc['basicinfolist']['basicinfo']
+    if not isinstance(attached_vms, list):
+        attached_vms = [ attached_vms ]
+    
+    found_count = 0
+    for vm in attached_vms:
+        for id in vm_ids:
+            if vm['objectId'] == id:
+                found_count = found_count + 1
+    
+    if found_count > 0:
+        return True
+    return False
+
+def attach_tags(stub, security_tag, vm_ids):
+    base_url = stub.schema['SecurityTag']['url']
+    for id in vm_ids:
+        request_url = "%s/%s/vm/%s" % (base_url, security_tag['objectId'], id)
+        (content, location) = stub._invoke('PUT', request_url, None)
+    return
+    
+def detach_tags(stub, security_tag, vm_ids):
+    base_url = stub.schema['SecurityTag']['url']
+    for id in vm_ids:
+        request_url = "%s/%s/vm/%s" % (base_url, security_tag['objectId'], id)
+        (content, location) = stub._invoke('DELETE', request_url, None)
+    return
+        
+def main():
+    module = AnsibleModule(
+        argument_spec = dict(
+            vsm_hostname = dict(type='str', required=True),
+            vsm_username = dict(type='str', required=True),
+            vsm_password = dict(type='str', required=True),
+            scopeid = dict(type='str', required=False, default='globalroot-0'),
+            tag = dict(type='str', required=True),
+            vms = dict(type='list', required=True),
+            state = dict(type='str', required=False, choices=['present', 'absent'], default='present'),
+        ),
+        supports_check_mode = True,
+    )
+
+    stub = NsxServiceStub(
+        module, 
+        hostname=module.params['vsm_hostname'],
+        username=module.params['vsm_username'],
+        password=module.params['vsm_password'],
+        scopeid=module.params['scopeid'],
+    )
+    
+    security_tag = stub.lookup('SecurityTag', 'name', module.params['tag'])
+    if security_tag == None:
+        state = 'absent'
+    else:
+        state = 'present'
+    vm_ids = module.params.get('vms', [ ])
+    
+    changed = False    
+    if module.params['state'] == 'absent':
+        if state == 'absent':
+            changed = False
+        else:
+            changed = compare_detached(stub, security_tag, vm_ids)
+            if changed and not module.check_mode:
+                detach_tags(stub, security_tag, vm_ids)
+    if module.params['state'] == 'present':
+        if state == 'absent':
+            module.fail_json(msg="could not attach vm to security tag: tag '%s' does not exist" 
+                % module.params['tag'])
+        else:
+            changed = compare_attached(stub, security_tag, vm_ids)
+            if changed and not module.check_mode:
+                attach_tags(stub, security_tag, vm_ids)
+    
+    if security_tag:
+        objectId = security_tag['objectId']
+    else:
+        objectId = None
+    result = dict(changed=changed, objectId=objectId)
+    module.exit_json(**result)
+ 
+from ansible.module_utils.basic import *
+main()
+ 
+    
+    
+    
+    
