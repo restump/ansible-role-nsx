@@ -109,6 +109,12 @@ options:
         specified order (rank) position.
     choices: ["absent", "present"]
     default: "present"
+  lastrule:
+    description:
+      - Flag to indicate the last rule in the policy chain.  Any rules with a higher rank
+        than this rule will be purged from the policy chain.
+    choices: ["yes", "no"]
+    default: "no"
   scopeid:
     description:
       - Scope of security policy
@@ -317,6 +323,9 @@ def compare_fw_rule(stub, policy, order, properties, idlists):
             actions = actionCategory.get('action', [ ])
             if not isinstance(actions, list):
                 actions = [ actions ]
+                
+    if lastrule and order < len(actions):
+        return True
     
     if order < 0 or order > len(actions):
         return True
@@ -436,7 +445,11 @@ def update_fw_rule(stub, policy, order, properties, idlists):
     # Action 'properties'
     for k,v in properties.iteritems():
         if v != None:
-            action[k] = v    
+            action[k] = v  
+            
+    # lastrule, delete any rules after this rule
+    if lastrule:
+        del actions[order - 1:-1]
 
     return
 
@@ -478,6 +491,7 @@ def main():
             groups = dict(type='list', required=False, default=[]),
             services = dict(type='list', required=False, default=[]),
             svcgroups = dict(type='list', required=False, default=[]),
+            lastrule = dict(type='bool', required=False, default=False),
             state = dict(type='str', 
                 required=False, 
                 choices=['present', 'absent'], 
@@ -519,6 +533,7 @@ def main():
                                     stub, 
                                     'ApplicationGroup', 
                                     module.params.get('svcgroups', [ ]))
+    lastrule = module.params['lastrule']
 
     changed = False 
     if module.params['state'] == 'absent':
@@ -530,10 +545,10 @@ def main():
         if not policy:
             module.fail_json(msg="requested security policy '%s' does not exist" %
                 module.params['secpolicy'])
-        changed = compare_fw_rule(stub, policy, order, properties, idlists)
+        changed = compare_fw_rule(stub, policy, order, properties, idlists, lastrule)
   
         if changed and not module.check_mode:
-            update_fw_rule(stub, policy, order, properties, idlists)
+            update_fw_rule(stub, policy, order, properties, idlists, lastrule)
             stub.update(policy, { })
     
     objectId = policy['objectId']
