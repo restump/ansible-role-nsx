@@ -313,7 +313,7 @@ def lookup_object_ids(stub, type, names):
         ids.append(object_id)
     return ids
     
-def compare_fw_rule(stub, policy, order, properties, idlists):    
+def compare_fw_rule(stub, policy, order, properties, idlists, lastrule):    
     actions = [ ]
     actionCategories = policy.get('actionsByCategory', [ ])
     if not isinstance(actionCategories, list):
@@ -389,7 +389,7 @@ def compare_fw_rule(stub, policy, order, properties, idlists):
             
     return False
 
-def update_fw_rule(stub, policy, order, properties, idlists):
+def update_fw_rule(stub, policy, order, properties, idlists, lastrule):
     actionCategories = policy.get('actionsByCategory', None)
     if actionCategories == None:
         policy['actionsByCategory'] = [ ]
